@@ -1,0 +1,281 @@
+<!--
+  MCP Apps sandbox proxy (SEP-1865 §"Sandbox proxy")
+  https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
+
+  This page is the OUTER iframe in the two-iframe sandbox model. Its only job:
+    1. Announce readiness to the host with `ui/notifications/sandbox-proxy-ready`.
+    2. Receive `ui/notifications/sandbox-resource-ready` from the host (HTML + CSP).
+    3. Mount an INNER iframe with the provided HTML, CSP meta tag, sandbox attrs,
+       and Permission Policy `allow` attribute.
+    4. Relay every non-`ui/notifications/sandbox-*` message bidirectionally between
+       the host (window.parent) and the inner iframe (View).
+
+  TODO(mcp-apps): Different-origin sandbox for production.
+  SEP-1865 §"Sandbox proxy" rule 1: "The Host and the Sandbox MUST have different origins."
+  https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
+  In dev we serve this page from Next.js public/ which is same-origin as the host. The
+  `allow-same-origin` sandbox flag therefore grants the proxy parent-DOM access, weakening
+  isolation. Production path: deploy this HTML to a separate subdomain (e.g. sandbox.example.com)
+  or static CDN, and set NEXT_PUBLIC_MCP_SANDBOX_URL so mcp-app-part.tsx points at it.
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MCP App Sandbox</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: transparent;
+      }
+      iframe {
+        border: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      (() => {
+        "use strict";
+
+        var hostWindow = window.parent;
+        var innerFrame = null;
+        var _innerReady = false;
+
+        // ------------------------------------------------------------------
+        // Tiny in-page logger. This file sits outside the Next.js bundle and
+        // cannot import lib/logger.ts, so we roll a ~20-line namespaced logger
+        // that mirrors pino levels and honors `?logLevel=<level>` on this
+        // page's URL (propagated from the host when constructing the sandbox
+        // URL). Default is "error" so production is silent unless asked.
+        // ------------------------------------------------------------------
+        var LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, silent: 100 };
+        var queryParams = new URLSearchParams(location.search);
+        var levelQuery = (queryParams.get("logLevel") || "error").toLowerCase();
+        var levelThreshold = LEVELS[levelQuery] != null ? LEVELS[levelQuery] : LEVELS.error;
+        // Gated by the host's NEXT_PUBLIC_DANGEROUSLY_ALLOW_UNSAFE_EVAL flag.
+        // When absent, we follow SEP-1865's spec-recommended CSP (no eval).
+        var allowUnsafeEval = queryParams.get("unsafeEval") === "1";
+
+        // CSP fallback injected via URL params by the host. Needed because
+        // @mcp-ui/client's AppRenderer does not currently forward the UI
+        // resource's `_meta.ui.csp` to AppFrame → sandbox-resource-ready, so
+        // `params.csp` usually arrives undefined and the inner iframe falls
+        // to the most restrictive CSP (`media-src 'self' data:`, etc.). The
+        // host pre-reads the resource itself and encodes the allowed origins
+        // as comma-separated lists on this page's URL; we merge them into the
+        // CSP when building the meta tag below. When upstream is fixed, the
+        // bridge-supplied CSP still wins; the URL fallback is additive.
+        function parseCspList(param) {
+          var raw = queryParams.get(param);
+          if (!raw) return [];
+          return raw.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        }
+        var urlFallbackCsp = {
+          resourceDomains: parseCspList("cspResources"),
+          connectDomains: parseCspList("cspConnects"),
+          frameDomains: parseCspList("cspFrames"),
+          baseUriDomains: parseCspList("cspBases"),
+        };
+        function emit(level, fields, msg) {
+          if (LEVELS[level] < levelThreshold) return;
+          var entry = Object.assign({ ns: "mcp-apps:sandbox", level: level, msg: msg }, fields || {});
+          var fn =
+            level === "warn" ? console.warn :
+            level === "error" ? console.error :
+            level === "trace" ? (console.trace || console.debug) :
+            level === "debug" ? console.debug :
+            console.info;
+          fn.call(console, "[mcp-apps:sandbox]", msg, entry);
+        }
+        var log = {
+          trace: (f, m) => { emit("trace", f, m); },
+          debug: (f, m) => { emit("debug", f, m); },
+          info:  (f, m) => { emit("info",  f, m); },
+          warn:  (f, m) => { emit("warn",  f, m); },
+          error: (f, m) => { emit("error", f, m); },
+        };
+
+        // Spec §"Sandbox proxy" step 3: announce readiness to host.
+        hostWindow.postMessage(
+          {
+            jsonrpc: "2.0",
+            method: "ui/notifications/sandbox-proxy-ready",
+            params: {},
+          },
+          "*",
+        );
+        log.debug({ origin: location.origin }, "sandbox-proxy-ready sent");
+
+        // Default iframe sandbox flags per spec. Callers may override via the
+        // `sandbox` field of `ui/notifications/sandbox-resource-ready`.
+        var DEFAULT_SANDBOX =
+          "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals";
+
+        // Build CSP string from resource metadata. Spec §"CSP Enforcement":
+        // restrictive defaults; only domains explicitly declared by the resource
+        // are allowed. Note: meta-tag CSP cannot set frame-ancestors (ignored by browsers);
+        // that directive applies on the HTTP response of this page itself.
+        //
+        // 'unsafe-eval' is only added when the host explicitly opts in via
+        // ?unsafeEval=1 on this page's URL (driven by the host's
+        // NEXT_PUBLIC_DANGEROUSLY_ALLOW_UNSAFE_EVAL flag). Default is the
+        // spec-recommended strict CSP — generative widgets won't run under
+        // that default; that's the intended spec tradeoff.
+        function mergeUnique(a, b) {
+          var seen = Object.create(null);
+          var out = [];
+          var push = function (v) {
+            if (!v || seen[v]) return;
+            seen[v] = 1;
+            out.push(v);
+          };
+          (a || []).forEach(push);
+          (b || []).forEach(push);
+          return out;
+        }
+
+        function buildCspMeta(csp) {
+          csp = csp || {};
+          // Merge bridge-supplied domains (authoritative when present) with
+          // the URL-fallback list; bridge values come first so order reflects
+          // intent, but the browser treats the CSP as a set.
+          var resourceList = mergeUnique(csp.resourceDomains, urlFallbackCsp.resourceDomains);
+          var connectList = mergeUnique(csp.connectDomains, urlFallbackCsp.connectDomains);
+          var frameList = mergeUnique(csp.frameDomains, urlFallbackCsp.frameDomains);
+          var baseList = mergeUnique(csp.baseUriDomains, urlFallbackCsp.baseUriDomains);
+          var resources = resourceList.join(" ");
+          var connects = connectList.join(" ");
+          var frames = frameList.length ? frameList.join(" ") : "'none'";
+          var bases = baseList.length ? baseList.join(" ") : "'self'";
+          var scriptExtras = allowUnsafeEval ? "'unsafe-eval' " : "";
+          return [
+            "default-src 'none'",
+            `script-src 'self' 'unsafe-inline' ${scriptExtras}${resources}`,
+            `style-src 'self' 'unsafe-inline' ${resources}`,
+            `img-src 'self' data: ${resources}`,
+            `font-src 'self' data: ${resources}`,
+            `media-src 'self' data: ${resources}`,
+            `connect-src 'self' ${connects}`,
+            `frame-src ${frames}`,
+            "object-src 'none'",
+            `base-uri ${bases}`,
+          ].join("; ");
+        }
+
+        // Maps `_meta.ui.permissions` → iframe `allow` attribute per spec
+        // §"Permission Policy" guidance.
+        function buildAllow(permissions) {
+          var tokens = [];
+          permissions = permissions || {};
+          if (permissions.camera) tokens.push("camera");
+          if (permissions.microphone) tokens.push("microphone");
+          if (permissions.geolocation) tokens.push("geolocation");
+          if (permissions.clipboardWrite) tokens.push("clipboard-write");
+          return tokens.join("; ");
+        }
+
+        function mountInner(html, opts) {
+          opts = opts || {};
+          if (innerFrame) {
+            log.debug({}, "replacing existing inner iframe");
+            innerFrame.remove();
+            innerFrame = null;
+            _innerReady = false;
+          }
+          innerFrame = document.createElement("iframe");
+          innerFrame.setAttribute("sandbox", opts.sandbox || DEFAULT_SANDBOX);
+          var allow = buildAllow(opts.permissions);
+          if (allow) innerFrame.setAttribute("allow", allow);
+          innerFrame.setAttribute("referrerpolicy", "no-referrer");
+          // srcdoc gives the inner frame a null origin (different from ours),
+          // which is exactly what we want for the View.
+          var cspMeta =
+            '<meta http-equiv="Content-Security-Policy" content="' +
+            buildCspMeta(opts.csp).replace(/"/g, "&quot;") +
+            '">';
+          // If the HTML already has a <head>, inject the CSP meta at the top
+          // of it; otherwise prepend a minimal <head>. Browsers apply meta CSP
+          // from the moment it's parsed, so it must appear before any script.
+          var srcdoc;
+          if (/<head[\s>]/i.test(html)) {
+            srcdoc = html.replace(/<head([^>]*)>/i, `<head$1>${cspMeta}`);
+          } else {
+            srcdoc = `<!doctype html><html><head>${cspMeta}</head><body>${html}</body></html>`;
+          }
+          innerFrame.srcdoc = srcdoc;
+          document.body.appendChild(innerFrame);
+          log.debug(
+            {
+              htmlLen: html.length,
+              srcdocLen: srcdoc.length,
+              sandbox: innerFrame.getAttribute("sandbox"),
+              allow: innerFrame.getAttribute("allow") || "",
+              hasCsp: Boolean(opts.csp),
+            },
+            "inner iframe mounted",
+          );
+        }
+
+        // Spec §"Sandbox proxy" step 6: relay messages bidirectionally, except
+        // reserved `ui/notifications/sandbox-*` methods which stay local to this page.
+        window.addEventListener("message", (event) => {
+          var data = event.data;
+          if (!data || data.jsonrpc !== "2.0") return;
+
+          // From HOST (window.parent)
+          if (event.source === hostWindow) {
+            if (data.method === "ui/notifications/sandbox-resource-ready") {
+              const params = data.params || {};
+              log.debug(
+                {
+                  htmlLen: (params.html || "").length,
+                  hasCsp: Boolean(params.csp),
+                  hasPermissions: Boolean(params.permissions),
+                  sandboxOverride: Boolean(params.sandbox),
+                },
+                "sandbox-resource-ready received",
+              );
+              mountInner(params.html || "", {
+                sandbox: params.sandbox,
+                csp: params.csp,
+                permissions: params.permissions,
+              });
+              return;
+            }
+            // Forward to inner once it's up.
+            if (innerFrame?.contentWindow) {
+              log.trace({ method: data.method, id: data.id }, "relay host→view");
+              innerFrame.contentWindow.postMessage(data, "*");
+            } else {
+              log.warn({ method: data.method }, "dropping host→view message (no inner iframe)");
+            }
+            return;
+          }
+
+          // From INNER iframe (the View)
+          if (innerFrame && event.source === innerFrame.contentWindow) {
+            // Drop sandbox-control messages; they're not for the host.
+            if (
+              typeof data.method === "string" &&
+              data.method.indexOf("ui/notifications/sandbox-") === 0
+            ) {
+              log.debug({ method: data.method }, "dropping sandbox-* from view");
+              return;
+            }
+            log.trace({ method: data.method, id: data.id }, "relay view→host");
+            hostWindow.postMessage(data, "*");
+            return;
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
