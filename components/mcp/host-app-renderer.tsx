@@ -73,6 +73,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useTaskRegistry } from "@/components/mcp/tasks/context";
 
 import {
 	readResourceHtml,
@@ -210,6 +211,7 @@ export const HostAppRenderer = forwardRef<
 
 	const [bridge, setBridge] = useState<AppBridge | null>(null);
 	const [html, setHtml] = useState<string | null>(htmlProp ?? null);
+	const taskRegistry = useTaskRegistry();
 	// `viewInitialized` flips true only after the View sends
 	// `ui/notifications/initialized`. Until then the transport is attached but
 	// the View hasn't completed its handshake, so host→view notifications like
@@ -420,6 +422,33 @@ export const HostAppRenderer = forwardRef<
 		const onInitializedEvt = () => {
 			setViewInitialized(true);
 			onAppCapabilitiesRef.current?.(b.getAppCapabilities());
+
+			// Task-aware `oncalltool` override. SEP-1865 §App class asserts tasks
+			// are not supported on the VIEW side (app-bridge.js: `assertTaskCapability
+			// — "Tasks are not supported in MCP Apps"`), so Views send plain
+			// `tools/call` requests regardless of whether the upstream tool is
+			// task-required. The host bridge is responsible for upgrading the
+			// call when the tool advertises `taskSupport !== "forbidden"`.
+			//
+			// Why wire here (not before connect): `AppBridge.connect()` auto-sets
+			// `oncalltool` when constructed with a non-null client. Its setter
+			// runs AFTER our effect body (connect fires from an AppFrame child
+			// effect). The `initialized` event fires post-connect, so reassigning
+			// oncalltool here wins. Radix-style `warnIfRequestHandlerReplaced`
+			// logs once per mount — documented behavior, not a bug.
+			//
+			// Views do NOT receive `notifications/tasks/status` (same spec
+			// constraint); the host's task tray is the only progress UI.
+			if (taskRegistry) {
+				b.oncalltool = async (params, extra) => {
+					const handle = taskRegistry.call(
+						params.name,
+						params.arguments ?? {},
+						{ signal: extra?.signal, mode: "auto" },
+					);
+					return handle.waitForResult();
+				};
+			}
 		};
 		b.addEventListener("initialized", onInitializedEvt);
 
@@ -453,7 +482,7 @@ export const HostAppRenderer = forwardRef<
 			// Close the underlying transport; errors here are terminal-only and safe to swallow.
 			b.close().catch(() => {});
 		};
-	}, [client, hostInfo, onResourceUpdated]);
+	}, [client, hostInfo, onResourceUpdated, taskRegistry]);
 
 	// --- Resource fetch ------------------------------------------------------
 	useEffect(() => {

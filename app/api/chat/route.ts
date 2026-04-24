@@ -6,12 +6,16 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
 	convertToModelMessages,
+	createUIMessageStream,
+	createUIMessageStreamResponse,
 	type JSONSchema7,
 	streamText,
 	type ToolSet,
 	type UIMessage,
 } from "ai";
 import { childLog, span } from "@/lib/logger";
+import { wrapToolSetWithTasks } from "@/lib/mcp/tasks/ai-sdk-adapter";
+import { TaskRegistry } from "@/lib/mcp/tasks/registry";
 
 const log = childLog("chat-route");
 
@@ -24,9 +28,7 @@ export const maxDuration = 30;
  * `InitializeResult.instructions` to the system prompt, labeled by the
  * server's self-reported name.
  */
-const MCP_SERVER_URLS: readonly string[] = [
-	process.env.MCP_SERVER_URL ?? ""
-];
+const MCP_SERVER_URLS: readonly string[] = [process.env.MCP_SERVER_URL ?? ""];
 
 interface ServerInstructions {
 	/** Server-reported name from `InitializeResult.serverInfo.name`. */
@@ -43,6 +45,25 @@ let cachedMCPTools: ToolSet | null = null;
 // caching across requests is correct; the only refresh path is a server
 // restart, which also restarts this Node process.
 let cachedInstructions: ReadonlyArray<ServerInstructions> | null = null;
+
+/**
+ * Module-scoped SDK client + task registry — the "task-capable peer" of
+ * `@ai-sdk/mcp`'s tool layer. We keep ONE connection for the life of the
+ * process so:
+ *   - Advertising task/elicitation/sampling capabilities happens once at
+ *     handshake (the client must advertise BEFORE the server knows it can
+ *     route elicitation/sampling requests back through `tasks/result`).
+ *   - The `TaskRegistry` owns a single `notifications/tasks/status` handler;
+ *     we don't want per-request handlers fighting each other.
+ *   - `wrapToolSetWithTasks` runs off the same `listTools()` source as
+ *     `@ai-sdk/mcp`'s internal call, avoiding divergent tool metadata views.
+ *
+ * Spec §Tasks: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks
+ * Spec §Sampling: https://modelcontextprotocol.io/specification/2025-11-25/client/sampling
+ * Spec §Elicitation: https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation
+ */
+let cachedTaskClient: Client | null = null;
+let cachedTaskRegistry: TaskRegistry | null = null;
 
 async function getMCPTools(): Promise<ToolSet> {
 	if (cachedMCPTools) return cachedMCPTools;
@@ -84,11 +105,13 @@ async function getMCPTools(): Promise<ToolSet> {
 
 /**
  * Read `InitializeResult.instructions` + `serverInfo.name` from every
- * configured MCP server via the reference SDK.
+ * configured MCP server via the reference SDK. Also elevates the client to
+ * module scope so the task registry can reuse it.
  *
  * `@ai-sdk/mcp` parses but discards `instructions` (its public surface only
- * exposes `serverInfo`), so we open a throwaway `@modelcontextprotocol/sdk`
- * client alongside it purely to extract both fields. One extra initialize
+ * exposes `serverInfo`), so we open a `@modelcontextprotocol/sdk` client
+ * alongside it to extract both fields AND provide the task/elicitation/
+ * sampling-aware channel for `wrapToolSetWithTasks`. One extra initialize
  * per server on cold start, cached for the lifetime of the process.
  *
  * Returns one entry per server that both (a) responded and (b) supplied a
@@ -96,7 +119,9 @@ async function getMCPTools(): Promise<ToolSet> {
  * omitted rather than returned with empty strings — the caller is building a
  * prompt, not a diagnostic log.
  */
-async function getMCPInstructions(): Promise<ReadonlyArray<ServerInstructions>> {
+async function getMCPInstructions(): Promise<
+	ReadonlyArray<ServerInstructions>
+> {
 	if (cachedInstructions !== null) return cachedInstructions;
 	const collected: ServerInstructions[] = [];
 	for (const url of MCP_SERVER_URLS) {
@@ -104,13 +129,57 @@ async function getMCPInstructions(): Promise<ReadonlyArray<ServerInstructions>> 
 			await span(log, "getMCPInstructions", { url }, async () => {
 				const client = new Client(
 					{ name: "audiostudio-chat-route", version: "1.0.0" },
-					{ capabilities: {} },
+					{
+						// Advertise every capability our route CAN service. Spec
+						// requires advertisement before the corresponding wire
+						// method is permitted:
+						//   - tasks.list / tasks.cancel                 → client-initiated
+						//   - tasks.requests.elicitation.create         → accept server→us elicitation
+						//     mid-task (drained over tasks/result)
+						//   - tasks.requests.sampling.createMessage     → accept server→us sampling
+						//   - elicitation{} / sampling{}                → standalone (non-task)
+						capabilities: {
+							tasks: {
+								list: {},
+								cancel: {},
+								requests: {
+									elicitation: { create: {} },
+									sampling: { createMessage: {} },
+								},
+							},
+							elicitation: {},
+							sampling: {},
+						},
+					},
 				);
 				const transport = new StreamableHTTPClientTransport(new URL(url));
 				await client.connect(transport);
 				const instructions = client.getInstructions();
 				const name = client.getServerVersion()?.name;
-				await client.close().catch(() => {});
+				// Hold the client; DO NOT close. Registry tracks this client for
+				// the process lifetime. The prior code closed after reading
+				// instructions; we now need the same client for task routing.
+				cachedTaskClient = client;
+				cachedTaskRegistry = new TaskRegistry(client);
+				// Seed the registry's task-support map so `mode: "auto"` can
+				// distinguish task-capable tools from plain ones.
+				try {
+					const toolsList = await client.listTools();
+					cachedTaskRegistry.setTaskSupportMap(
+						toolsList.tools.map((t) => {
+							const support = (
+								t as {
+									execution?: {
+										taskSupport?: "required" | "optional" | "forbidden";
+									};
+								}
+							).execution?.taskSupport;
+							return [t.name, support] as const;
+						}),
+					);
+				} catch (err) {
+					log.warn({ err }, "task registry: listTools seed failed");
+				}
 				log.debug(
 					{
 						url,
@@ -152,10 +221,6 @@ export async function POST(req: Request) {
 			getMCPInstructions(),
 		]);
 		const frontendToolSet = frontendTools(tools ?? {});
-		const combinedTools = {
-			...mcpTools,
-			...frontendToolSet,
-		};
 
 		// MCP spec: `InitializeResult.instructions` "MAY be added to the system
 		// prompt." Each server gets its own labeled section (using the server's
@@ -166,85 +231,91 @@ export async function POST(req: Request) {
 		const combinedSystem =
 			[
 				...mcpInstructionsList.map(
-					(s) => `## Instructions from MCP server "${s.name}"\n\n${s.instructions}`,
+					(s) =>
+						`## Instructions from MCP server "${s.name}"\n\n${s.instructions}`,
 				),
 				system,
 			]
 				.filter(Boolean)
 				.join("\n\n") || undefined;
 
-		log.debug(
-			{
-				messageCount: messages.length,
-				hasClientSystem: Boolean(system),
-				mcpServersWithInstructions: mcpInstructionsList.map((s) => ({
-					name: s.name,
-					len: s.instructions.length,
-				})),
-				toolNames: Object.keys(combinedTools),
-				mcpToolCount: Object.keys(mcpTools).length,
-				frontendToolCount: Object.keys(frontendToolSet).length,
-			},
-			"invoking streamText",
-		);
-
-		const result = streamText({
-			model: openai.responses("gpt-5-nano"),
-			messages: await convertToModelMessages(messages),
-			system: combinedSystem,
-			tools: combinedTools,
-			providerOptions: {
-				openai: {
-					reasoningEffort: "medium",
-					reasoningSummary: "auto",
-					// `store: false` is the SDK-blessed path for multi-turn
-					// reasoning in our setup (client echoes full history back;
-					// threads can branch and merge; we're not using OpenAI's
-					// server-side `conversation`).
-					//
-					// When `store: false` AND the model is a reasoning model,
-					// `@ai-sdk/openai` auto-adds `include:
-					// ["reasoning.encrypted_content"]` to the request
-					// (dist/index.js:4761-4764). The response then carries
-					// `encrypted_content` on each reasoning part, which the
-					// provider rehydrates into assistant `ReasoningPart`s and
-					// re-sends inline as `{ type: "reasoning", encrypted_content,
-					// summary }` on subsequent turns (dist/index.js:2975-2988).
-					// No `rs_*` ID is ever sent as an `item_reference`, so:
-					//   - No 404 "Item with id 'rs_...' not found" (those come
-					//     from store:true + missing stored item).
-					//   - No 400 "Duplicate item found" (no shared IDs to dedupe).
-					//   - Pre-fix history (reasoning parts without
-					//     `encrypted_content`) is filtered by the SDK with a
-					//     warning (dist/index.js:3237-3246) rather than breaking.
-					//   - Works across threads, across branches, and past any
-					//     OpenAI retention window.
-					//
-					// See vercel/ai#10060 for the maintainer-endorsed pattern.
-					store: false,
-				},
-			},
-		});
-
-		return result.toUIMessageStreamResponse({
-			sendReasoning: true,
-			// AI SDK v6 server contract: without `originalMessages`, the SDK
-			// calls `getResponseUIMessageId()` and mints a FRESH id for the
-			// assistant-message-in-progress on every turn. On auto-continue
-			// (our `sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls`),
-			// the client re-POSTs the already-created assistant message; the
-			// server then appends into a new id, producing two UIMessages that
-			// share content. `useAISDKRuntime` re-imports both, and
-			// `MessageRepository.performOp("link", …)` trips on the ancestor-
-			// chain check (`@assistant-ui/core/dist/runtime/utils/
-			// message-repository.js:87-92`) with "A message with the same id
-			// already exists in the parent tree."
-			//
-			// Passing `originalMessages` tells the SDK to reuse the trailing
-			// assistant message id instead of minting. Canonical fix per
-			// vercel/ai#8854 and assistant-ui#3293.
+		// Build the UI message stream ourselves so our task-aware tool
+		// wrappers have a `UIMessageStreamWriter` to emit `data-task-progress`
+		// parts on. `streamText(...).toUIMessageStreamResponse(...)` can't
+		// expose the writer to tools because tool.execute is called BEFORE
+		// the UI response is constructed. `createUIMessageStream` flips the
+		// order: execute is given a writer and we merge streamText's output
+		// into it.
+		const stream = createUIMessageStream({
 			originalMessages: messages,
+			execute: async ({ writer }) => {
+				let combinedTools: ToolSet = {
+					...mcpTools,
+					...frontendToolSet,
+				};
+				if (cachedTaskClient && cachedTaskRegistry) {
+					combinedTools = await wrapToolSetWithTasks(
+						combinedTools,
+						cachedTaskClient,
+						{
+							registry: cachedTaskRegistry,
+							writer,
+						},
+					);
+				}
+
+				log.debug(
+					{
+						messageCount: messages.length,
+						hasClientSystem: Boolean(system),
+						mcpServersWithInstructions: mcpInstructionsList.map((s) => ({
+							name: s.name,
+							len: s.instructions.length,
+						})),
+						toolNames: Object.keys(combinedTools),
+						mcpToolCount: Object.keys(mcpTools).length,
+						frontendToolCount: Object.keys(frontendToolSet).length,
+						taskWrappersActive: Boolean(cachedTaskClient && cachedTaskRegistry),
+					},
+					"invoking streamText",
+				);
+
+				const result = streamText({
+					model: openai.responses("gpt-5-nano"),
+					messages: await convertToModelMessages(messages),
+					system: combinedSystem,
+					tools: combinedTools,
+					providerOptions: {
+						openai: {
+							reasoningEffort: "medium",
+							reasoningSummary: "auto",
+							// `store: false` is the SDK-blessed path for multi-turn
+							// reasoning in our setup (client echoes full history back;
+							// threads can branch and merge; we're not using OpenAI's
+							// server-side `conversation`).
+							//
+							// When `store: false` AND the model is a reasoning model,
+							// `@ai-sdk/openai` auto-adds `include:
+							// ["reasoning.encrypted_content"]` to the request
+							// (dist/index.js:4761-4764). The response then carries
+							// `encrypted_content` on each reasoning part, which the
+							// provider rehydrates into assistant `ReasoningPart`s and
+							// re-sends inline as `{ type: "reasoning", encrypted_content,
+							// summary }` on subsequent turns (dist/index.js:2975-2988).
+							store: false,
+						},
+					},
+				});
+
+				writer.merge(
+					result.toUIMessageStream({
+						sendReasoning: true,
+					}),
+				);
+			},
 		});
+
+		return createUIMessageStreamResponse({ stream });
 	});
 }
 

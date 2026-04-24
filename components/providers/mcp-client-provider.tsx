@@ -45,6 +45,42 @@ const log = childLog("mcp-client");
 
 const DEFAULT_MCP_URL = process.env.NEXT_PUBLIC_MCP_SERVER_URL ?? "";
 
+// Session-pin storage. Scoped per endpoint so multi-server setups don't
+// cross-wire. SessionStorage (not localStorage) — sessions shouldn't
+// survive browser close; they're tied to the MCP server's in-memory task
+// store, which is ephemeral anyway.
+const SESSION_KEY_PREFIX = "mcp:session:";
+
+function readStoredSessionId(endpoint: string): string | undefined {
+	if (typeof window === "undefined") return undefined;
+	try {
+		return (
+			window.sessionStorage.getItem(SESSION_KEY_PREFIX + endpoint) ?? undefined
+		);
+	} catch {
+		// Private mode or quota — no persistence, just carry on.
+		return undefined;
+	}
+}
+
+function writeStoredSessionId(endpoint: string, sessionId: string): void {
+	if (typeof window === "undefined") return;
+	try {
+		window.sessionStorage.setItem(SESSION_KEY_PREFIX + endpoint, sessionId);
+	} catch {
+		// Best-effort; worst case is losing task continuity on refresh.
+	}
+}
+
+function clearStoredSessionId(endpoint: string): void {
+	if (typeof window === "undefined") return;
+	try {
+		window.sessionStorage.removeItem(SESSION_KEY_PREFIX + endpoint);
+	} catch {
+		/* noop */
+	}
+}
+
 type ConnectionStatus = "idle" | "connecting" | "ready" | "error";
 
 export interface ToolUIInfo {
@@ -171,18 +207,49 @@ export function McpClientProvider({ children, url }: McpClientProviderProps) {
 			}
 			return resp;
 		};
+		// MCP 2025-11-25 §Session Management: sessionIds enable a client to
+		// resume a session after a page reload. We stash the server-issued id
+		// in sessionStorage and pass it back on the next mount. The SDK's
+		// `StreamableHTTPClientTransport` accepts a `sessionId` option
+		// (streamableHttp.d.ts:87-90) and updates its internal tracking from
+		// the `MCP-Session-Id` response header on subsequent roundtrips.
+		const storedSessionId = readStoredSessionId(endpoint);
 		const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
 			fetch: tracingFetch,
+			...(storedSessionId ? { sessionId: storedSessionId } : {}),
 		});
 		const nextClient = new Client(
 			{ name: "audiostudio-host", version: "1.0.0" },
 			{
-				// Advertise MCP Apps support — spec §"Client (Host) Capabilities".
-				// `UI_EXTENSION_CAPABILITIES` from @mcp-ui/client expands to
-				// `{ "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] } }`
-				// (the single source of truth; matches RESOURCE_MIME_TYPE).
+				// Advertise MCP Apps + Tasks + Elicitation + Sampling capabilities.
+				//
+				// Spec §"Client (Host) Capabilities" (SEP-1865 + 2025-11-25):
+				// - `extensions`: `UI_EXTENSION_CAPABILITIES` from @mcp-ui/client
+				//   → `{ "io.modelcontextprotocol/ui": { mimeTypes: [...] } }`.
+				// - `tasks`: participation in MCP 2025-11-25 Tasks. The nested
+				//   `requests.elicitation.create` / `requests.sampling.createMessage`
+				//   advertise that we WILL handle server-initiated requests that
+				//   arrive over a task's blocking `tasks/result` response
+				//   (shared/protocol.js:586-591 + 289 + 378-388).
+				// - `elicitation`: standalone (non-task) elicitation.
+				// - `sampling`: standalone LLM-in-the-loop; server may request a
+				//   sample from us outside a task.
+				//
+				// Subjective: we advertise sampling even though the approval modal
+				// is the minimum UX — spec-correct refusal requires us to HANDLE
+				// the request and return `decline`, not ignore it entirely.
 				capabilities: {
 					extensions: UI_EXTENSION_CAPABILITIES,
+					tasks: {
+						list: {},
+						cancel: {},
+						requests: {
+							elicitation: { create: {} },
+							sampling: { createMessage: {} },
+						},
+					},
+					elicitation: {},
+					sampling: {},
 				},
 				// Library auto-handles list-changed notifications; we refresh our
 				// local registries in the callback. Spec §"Lifecycle & notifications".
@@ -369,6 +436,16 @@ export function McpClientProvider({ children, url }: McpClientProviderProps) {
 				setPrompts(promptsResult.prompts as Prompt[]);
 				setSupportsCompletions(hasCompletionsCap);
 				setStatus("ready");
+				// Session pinning: persist whatever sessionId the transport
+				// settled on after `initialize`. We do this AFTER connect() so
+				// the server-assigned id is authoritative (the stored value may
+				// have been rotated out by the server if it didn't match).
+				const settledSessionId = (
+					transport as unknown as { sessionId?: string }
+				).sessionId;
+				if (settledSessionId) {
+					writeStoredSessionId(endpoint, settledSessionId);
+				}
 				log.info(
 					{
 						toolCount: tools.tools.length,
@@ -389,6 +466,12 @@ export function McpClientProvider({ children, url }: McpClientProviderProps) {
 					{ err, url: endpoint },
 					"MCP client init failed — MCP Apps disabled for this session",
 				);
+				// Session pinning: if initialize failed with a stored session,
+				// it may be a dead sessionId from a previous server run. Clear
+				// so the next mount attempts a fresh handshake.
+				if (storedSessionId) {
+					clearStoredSessionId(endpoint);
+				}
 				setError(err instanceof Error ? err : new Error(String(err)));
 				setStatus("error");
 			}
