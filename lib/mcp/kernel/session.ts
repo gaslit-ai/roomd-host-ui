@@ -86,7 +86,7 @@ export class McpHostKernel {
   constructor(url = MCP_SERVER_URL) {
     if (!url) throw new Error("MCP_SERVER_URL is not configured");
     this.client = new Client(
-      { name: "audiostudio-host-kernel", version: "1.0.0" },
+      { name: "roomd-host-ui-host-kernel", version: "1.0.0" },
       {
         capabilities: defaultHostCapabilities(),
       },
@@ -338,7 +338,7 @@ export class McpHostKernel {
           protocolVersion,
           capabilities: this.serverCapabilities ?? {},
           serverInfo: this.serverInfo ?? {
-            name: "audiostudio-mcp-proxy",
+            name: "roomd-host-ui-mcp-proxy",
             version: "1.0.0",
           },
           instructions: this.instructions,

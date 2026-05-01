@@ -1,25 +1,21 @@
-This is the [assistant-ui](https://github.com/assistant-ui/assistant-ui) starter project.
+# roomd-host-ui
 
-## Getting Started
+MCP Apps host UI for Roomd, built with Next.js, assistant-ui, and the MCP TypeScript SDK.
 
-First, add your OpenAI API key to `.env.local` file:
+## Getting started
+
+Create `.env.local` with an OpenAI API key and the Roomd MCP endpoint:
 
 ```
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+MCP_SERVER_URL=http://localhost:8090/rooms/example/mcp
 ```
 
-Then, run the development server:
+Then install dependencies and run the development server:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.

@@ -126,7 +126,7 @@ export interface McpAppHostController {
 }
 
 const DEFAULT_HOST_INFO: Implementation = {
-  name: "audiostudio-host",
+  name: "roomd-host-ui-host",
   version: "1.0.0",
 };
 

@@ -104,7 +104,7 @@ function buildHostContext(theme: "light" | "dark"): McpUiHostContext {
 		availableDisplayModes: AVAILABLE_DISPLAY_MODES,
 		locale,
 		timeZone,
-		userAgent: "audiostudio/1.0 assistant-ui",
+		userAgent: "roomd-host-ui/1.0 assistant-ui",
 		platform: "web",
 		deviceCapabilities: { touch, hover },
 		// TODO(mcp-apps): safeAreaInsets.

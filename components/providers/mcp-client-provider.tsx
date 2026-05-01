@@ -216,7 +216,7 @@ export function McpClientProvider({ children, url }: McpClientProviderProps) {
     const endpoint = url ?? DEFAULT_PROXY_URL;
     const transport = new BrowserMcpProxyTransport(endpoint);
     const nextClient = new Client(
-      { name: "audiostudio-host", version: "1.0.0" },
+      { name: "roomd-host-ui-host", version: "1.0.0" },
       {
         capabilities: defaultHostCapabilities(),
       },

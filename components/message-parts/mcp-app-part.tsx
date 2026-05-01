@@ -19,8 +19,8 @@
  *
  * Host-local non-spec extensions, reverse-DNS-namespaced per SEP-1724 and
  * routed through `onFallbackRequest`. See `lib/mcp/host-identity.ts`:
- *   io.audiostudio/clipboard.read   — navigator.clipboard.readText
- *   io.audiostudio/clipboard.write  — navigator.clipboard.writeText
+ *   ai.gaslit.roomd-host-ui/clipboard.read   — navigator.clipboard.readText
+ *   ai.gaslit.roomd-host-ui/clipboard.write  — navigator.clipboard.writeText
  *
  * Not handled from iframes (by design, per spec §"Standard MCP Messages"):
  *   sampling/createMessage, elicitation/create — Views MAY NOT send these.

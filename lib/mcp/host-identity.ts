@@ -13,16 +13,17 @@
  * Consumers SHOULD NOT hardcode the namespace string. Add a new constant
  * here and import it. Changing the namespace is then a one-line change.
  *
- * Why `io.audiostudio`: matches the repo name; not registered anywhere
- * authoritative but collisions are unlikely and the prefix is human-readable.
+ * Why `ai.gaslit.roomd-host-ui`: matches the repository's public identity
+ * under the Gaslit AI namespace and keeps host-local extensions collision-
+ * resistant.
  *
  * https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
  */
 
 /** Root reverse-DNS namespace for everything this host owns. */
-export const HOST_NAMESPACE = "io.audiostudio" as const;
+export const HOST_NAMESPACE = "ai.gaslit.roomd-host-ui" as const;
 
-/** Build a reverse-DNS-namespaced identifier (`io.audiostudio/<path>`). */
+/** Build a reverse-DNS-namespaced identifier (`ai.gaslit.roomd-host-ui/<path>`). */
 function ns<P extends string>(path: P): `${typeof HOST_NAMESPACE}/${P}` {
 	return `${HOST_NAMESPACE}/${path}` as const;
 }
