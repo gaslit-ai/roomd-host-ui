@@ -41,14 +41,6 @@ import type {
   McpUiToolInputPartialNotification,
   McpUiUpdateModelContextRequest,
 } from "@modelcontextprotocol/ext-apps/app-bridge";
-// AppBridge is imported directly from ext-apps rather than from @mcp-ui/client
-// because @mcp-ui/client@7.0.0's CJS bundle (dist/index.js) was built against a
-// pre-1.4.0 ext-apps and omits `addEventListener` on its AppBridge class; the
-// ESM bundle has it but module resolution can pick the CJS path, producing
-// runtime `b.addEventListener is not a function`. ext-apps 1.6.0 is the source
-// of truth for AppBridge; @mcp-ui/client only retains value here as the
-// provider of AppFrame + types.
-import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type {
   CallToolResult,
@@ -59,22 +51,7 @@ import type {
   PromptListChangedNotification,
   ResourceListChangedNotification,
   ResourceUpdatedNotification,
-  Tool,
   ToolListChangedNotification,
-} from "@modelcontextprotocol/sdk/types.js";
-import {
-  CallToolResultSchema,
-  ErrorCode,
-  ListPromptsResultSchema,
-  ListResourcesResultSchema,
-  ListResourceTemplatesResultSchema,
-  ListToolsRequestSchema,
-  ListToolsResultSchema,
-  McpError,
-  ReadResourceResultSchema,
-  ResultSchema,
-  SubscribeRequestSchema,
-  UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   forwardRef,
@@ -86,20 +63,17 @@ import {
 } from "react";
 
 import {
-  filterToolsForApp,
-  listAllTools,
-  toolVisibilityRejection,
-} from "@/lib/mcp/catalog";
+  createMcpAppHostController,
+  type McpAppHostController,
+  type McpAppHostRequestHandlerExtra,
+} from "@/lib/mcp/apps/host-controller";
 import {
   readResourceHtml,
   resolveToolResourceUri,
 } from "@/lib/mcp/resource-loader";
 import { useContainerDimensions } from "@/lib/mcp/use-container-dimensions";
 
-type RequestHandlerExtra = {
-  signal: AbortSignal;
-  sessionId?: string;
-};
+type RequestHandlerExtra = McpAppHostRequestHandlerExtra;
 
 export interface HostAppRendererHandle {
   /** Forward a `tools/list_changed` notification to the view. */
@@ -196,11 +170,6 @@ export interface HostAppRendererProps {
   ) => () => void;
 }
 
-const DEFAULT_HOST_INFO: Implementation = {
-  name: "audiostudio-host",
-  version: "1.0.0",
-};
-
 export const HostAppRenderer = forwardRef<
   HostAppRendererHandle,
   HostAppRendererProps
@@ -236,375 +205,70 @@ export const HostAppRenderer = forwardRef<
     onPromptListChanged,
   } = props;
 
-  const [bridge, setBridge] = useState<AppBridge | null>(null);
+  const [controller, setController] = useState<McpAppHostController | null>(
+    null,
+  );
+  const controllerRef = useRef<McpAppHostController | null>(null);
   const [html, setHtml] = useState<string | null>(htmlProp ?? null);
-  // `viewInitialized` flips true only after the View sends
-  // `ui/notifications/initialized`. Until then the transport is attached but
-  // the View hasn't completed its handshake, so host→view notifications like
-  // `tool-input-partial` would throw "Not connected" (during streaming, when
-  // `bridge.connect()` may not have run yet) or arrive before the View has
-  // handlers installed. Gating sends on this flag naturally queues the
-  // latest value — when init completes, the effect re-runs and sends it.
-  const [viewInitialized, setViewInitialized] = useState(false);
-
-  // Latest-ref pattern: handler + config changes don't tear down the bridge.
-  // `hostCapabilities` is captured at bridge creation (spec's `ui/initialize`
-  // response is immutable post-handshake); `hostContext` updates propagate
-  // via `setHostContext()` in a separate effect.
-  const onMessageRef = useRef(onMessage);
-  const onOpenLinkRef = useRef(onOpenLink);
-  const onDownloadFileRef = useRef(onDownloadFile);
-  const onUpdateModelContextRef = useRef(onUpdateModelContext);
-  const onRequestDisplayModeRef = useRef(onRequestDisplayMode);
-  const onRequestTeardownRef = useRef(onRequestTeardown);
-  const onLoggingMessageRef = useRef(onLoggingMessage);
-  const onAppCapabilitiesRef = useRef(onAppCapabilities);
-  const onFallbackRequestRef = useRef(onFallbackRequest);
+  const latestControllerInputsRef = useRef({
+    hostCapabilities,
+    hostContext,
+    handlers: {
+      onMessage,
+      onOpenLink,
+      onDownloadFile,
+      onUpdateModelContext,
+      onRequestDisplayMode,
+      onRequestTeardown,
+      onLoggingMessage,
+      onAppCapabilities,
+      onFallbackRequest,
+      onError,
+    },
+  });
   const onErrorRef = useRef(onError);
-  const hostCapabilitiesRef = useRef(hostCapabilities);
-  const hostContextRef = useRef(hostContext);
   useEffect(() => {
-    onMessageRef.current = onMessage;
-    onOpenLinkRef.current = onOpenLink;
-    onDownloadFileRef.current = onDownloadFile;
-    onUpdateModelContextRef.current = onUpdateModelContext;
-    onRequestDisplayModeRef.current = onRequestDisplayMode;
-    onRequestTeardownRef.current = onRequestTeardown;
-    onLoggingMessageRef.current = onLoggingMessage;
-    onAppCapabilitiesRef.current = onAppCapabilities;
-    onFallbackRequestRef.current = onFallbackRequest;
+    latestControllerInputsRef.current = {
+      hostCapabilities,
+      hostContext,
+      handlers: {
+        onMessage,
+        onOpenLink,
+        onDownloadFile,
+        onUpdateModelContext,
+        onRequestDisplayMode,
+        onRequestTeardown,
+        onLoggingMessage,
+        onAppCapabilities,
+        onFallbackRequest,
+        onError,
+      },
+    };
     onErrorRef.current = onError;
-    hostCapabilitiesRef.current = hostCapabilities;
-    hostContextRef.current = hostContext;
   });
 
-  // --- Bridge lifecycle ----------------------------------------------------
+  // --- Controller lifecycle ------------------------------------------------
   useEffect(() => {
-    setViewInitialized(false);
-    const initialCaps = hostCapabilitiesRef.current;
-    const initialCtx = hostContextRef.current;
-    const b = new AppBridge(
-      null,
-      hostInfo ?? DEFAULT_HOST_INFO,
-      initialCaps,
-      initialCtx ? { hostContext: initialCtx } : undefined,
-    );
-
-    // Request/notification handlers. We intentionally construct AppBridge
-    // without the shared MCP Client and wire forwarding ourselves: the MCP
-    // SDK keeps one notification handler per method, so AppBridge's
-    // auto-forwarding would clobber the provider-level fan-out used by every
-    // mounted view.
-    b.onmessage = async (params, extra) => {
-      const cb = onMessageRef.current;
-      if (!cb)
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          "ui/message not supported",
-        );
-      return cb(params, extra);
-    };
-    b.onopenlink = async (params, extra) => {
-      const cb = onOpenLinkRef.current;
-      if (!cb)
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          "ui/open-link not supported",
-        );
-      return cb(params, extra);
-    };
-    b.ondownloadfile = async (params, extra) => {
-      const cb = onDownloadFileRef.current;
-      if (!cb)
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          "ui/download-file not supported",
-        );
-      return cb(params, extra);
-    };
-    b.onupdatemodelcontext = async (params, extra) => {
-      const cb = onUpdateModelContextRef.current;
-      if (!cb)
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          "ui/update-model-context not supported",
-        );
-      return cb(params, extra);
-    };
-    b.onrequestdisplaymode = async (params, extra) => {
-      const cb = onRequestDisplayModeRef.current;
-      if (!cb)
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          "ui/request-display-mode not supported",
-        );
-      return cb(params, extra);
-    };
-    b.onloggingmessage = (params) => {
-      onLoggingMessageRef.current?.(params);
-    };
-
-    let cachedTools: readonly Tool[] | null = null;
-    const readAllTools = async (signal?: AbortSignal) => {
-      if (cachedTools) return cachedTools;
-      const tools = await listAllTools(client, signal ? { signal } : undefined);
-      cachedTools = tools;
-      return tools;
-    };
-    const getAppCallableTool = async (name: string, signal?: AbortSignal) => {
-      const tools = await readAllTools(signal);
-      const tool = tools.find((item) => item.name === name);
-      if (!tool) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Unknown MCP tool: ${name}`,
-        );
-      }
-      const rejection = toolVisibilityRejection(tool, "app");
-      if (rejection) {
-        throw new McpError(ErrorCode.InvalidRequest, rejection);
-      }
-      return tool;
-    };
-
-    b.oncalltool = async (params, extra) => {
-      const tool = await getAppCallableTool(params.name, extra?.signal);
-      return client.request(
-        {
-          method: "tools/call",
-          params: {
-            name: tool.name,
-            arguments: params.arguments ?? {},
-          },
-        },
-        CallToolResultSchema,
-        { signal: extra?.signal },
-      );
-    };
-    b.setRequestHandler(ListToolsRequestSchema, async (_req, extra) => {
-      const tools = filterToolsForApp(await readAllTools(extra.signal));
-      return ListToolsResultSchema.parse({ tools });
+    const initial = latestControllerInputsRef.current;
+    const next = createMcpAppHostController({
+      client,
+      hostInfo,
+      hostCapabilities: initial.hostCapabilities,
+      hostContext: initial.hostContext,
+      ...initial.handlers,
+      onResourceUpdated,
+      onToolListChanged,
+      onResourceListChanged,
+      onPromptListChanged,
     });
-    b.onlistresources = async (params, extra) =>
-      client.request(
-        { method: "resources/list", params },
-        ListResourcesResultSchema,
-        { signal: extra.signal },
-      );
-    b.onlistresourcetemplates = async (params, extra) =>
-      client.request(
-        { method: "resources/templates/list", params },
-        ListResourceTemplatesResultSchema,
-        { signal: extra.signal },
-      );
-    b.onreadresource = async (params, extra) =>
-      client.request(
-        { method: "resources/read", params },
-        ReadResourceResultSchema,
-        { signal: extra.signal },
-      );
-    b.onlistprompts = async (params, extra) =>
-      client.request(
-        { method: "prompts/list", params },
-        ListPromptsResultSchema,
-        { signal: extra.signal },
-      );
-
-    // `resources/subscribe` and `resources/unsubscribe` — SEP-1865 lists
-    // `resources/read` as the only resource method views are guaranteed to
-    // call, but the base MCP spec subscribe/unsubscribe methods are how
-    // views track mutable resources like `<scheme>://sessions/.../state`
-    // that the server updates via `notifications/resources/updated`.
-    // AppBridge has no typed setters for subscribe/unsubscribe, so we
-    // register them explicitly.
-    //
-    // We register unconditionally rather than gating on
-    // `client.getServerCapabilities()?.resources?.subscribe`: roomd-style
-    // pass-through servers may strip capability bits while still forwarding
-    // the underlying request, so the capability flag is an unreliable
-    // signal. If the upstream server genuinely lacks subscribe support,
-    // `client.request()` will reject with the server's error and we
-    // propagate that to the view — same outcome as falling through to
-    // `fallbackRequestHandler`, but via the correct error path.
-    //
-    // Use `ResultSchema` (loose) rather than `EmptyResultSchema` (strict)
-    // when validating the upstream response. SEP-1865 + base MCP say
-    // `resources/subscribe` returns an empty result, but some servers
-    // (observed in roomd pass-through) return `{ ok: true }` or other
-    // extra keys. A strict validator throws `Unrecognized key: 'ok'`,
-    // which surfaces on the view as a -32603 and aborts the subscription.
-    // `ResultSchema` (`z.looseObject`) tolerates extra keys while still
-    // requiring a valid JSON-RPC result envelope. We discard the body
-    // anyway — subscribe is effectively fire-and-await-ack.
-    const subscribedUris = new Set<string>();
-    b.setRequestHandler(SubscribeRequestSchema, async (req, extra) => {
-      await client.request(
-        { method: "resources/subscribe", params: req.params },
-        ResultSchema,
-        { signal: extra.signal },
-      );
-      subscribedUris.add(req.params.uri);
-      return {};
-    });
-    b.setRequestHandler(UnsubscribeRequestSchema, async (req, extra) => {
-      await client.request(
-        { method: "resources/unsubscribe", params: req.params },
-        ResultSchema,
-        { signal: extra.signal },
-      );
-      subscribedUris.delete(req.params.uri);
-      return {};
-    });
-
-    // Register the provider-side fan-out listener BEFORE the bridge
-    // connects, so updates that arrive between subscribe-ack and first
-    // notification can't race past us. Filter on URIs the view
-    // specifically asked for — the provider broadcasts every update it
-    // sees, and other widgets on this client may subscribe to disjoint
-    // URIs.
-    //
-    // The cast on `notification()` is deliberate: AppBridge types the
-    // argument as a union of the notifications it knows about (tool-input,
-    // host-context-changed, list_changed relays, etc.) which omits base
-    // MCP notifications like `resources/updated`. The underlying
-    // Protocol class accepts any JSON-RPC notification — this is a
-    // type-level restriction, not a runtime one. SEP-1865 §"Standard
-    // MCP Messages" explicitly allows base MCP notifications to flow
-    // through the host↔view bridge.
-    type BridgeNotification = Parameters<typeof b.notification>[0];
-    let initialized = false;
-    let hasPendingToolListChanged = false;
-    let pendingToolListChanged: ToolListChangedNotification["params"];
-    let hasPendingResourceListChanged = false;
-    let pendingResourceListChanged: ResourceListChangedNotification["params"];
-    let hasPendingPromptListChanged = false;
-    let pendingPromptListChanged: PromptListChangedNotification["params"];
-    const reportBridgeError = (err: unknown) => {
-      const e = err instanceof Error ? err : new Error(String(err));
-      onErrorRef.current?.(e);
-    };
-    const sendToolListChanged = (
-      params: ToolListChangedNotification["params"],
-    ) => {
-      cachedTools = null;
-      if (!initialized) {
-        hasPendingToolListChanged = true;
-        pendingToolListChanged = params;
-        return;
-      }
-      b.sendToolListChanged(params).catch(reportBridgeError);
-    };
-    const sendResourceListChanged = (
-      params: ResourceListChangedNotification["params"],
-    ) => {
-      if (!initialized) {
-        hasPendingResourceListChanged = true;
-        pendingResourceListChanged = params;
-        return;
-      }
-      b.sendResourceListChanged(params).catch(reportBridgeError);
-    };
-    const sendPromptListChanged = (
-      params: PromptListChangedNotification["params"],
-    ) => {
-      if (!initialized) {
-        hasPendingPromptListChanged = true;
-        pendingPromptListChanged = params;
-        return;
-      }
-      b.sendPromptListChanged(params).catch(reportBridgeError);
-    };
-    const flushListChanged = () => {
-      if (hasPendingToolListChanged) {
-        hasPendingToolListChanged = false;
-        sendToolListChanged(pendingToolListChanged);
-      }
-      if (hasPendingResourceListChanged) {
-        hasPendingResourceListChanged = false;
-        sendResourceListChanged(pendingResourceListChanged);
-      }
-      if (hasPendingPromptListChanged) {
-        hasPendingPromptListChanged = false;
-        sendPromptListChanged(pendingPromptListChanged);
-      }
-    };
-    const unsubscribeFanOut = onResourceUpdated?.((params) => {
-      if (!subscribedUris.has(params.uri)) return;
-      b.notification({
-        method: "notifications/resources/updated",
-        params,
-      } as unknown as BridgeNotification).catch((err) => {
-        reportBridgeError(err);
-      });
-    });
-    const unsubscribeToolListChanged = onToolListChanged?.(sendToolListChanged);
-    const unsubscribeResourceListChanged = onResourceListChanged?.(
-      sendResourceListChanged,
-    );
-    const unsubscribePromptListChanged = onPromptListChanged?.(
-      sendPromptListChanged,
-    );
-
-    // `ui/notifications/request-teardown` — spec: "host decides whether to
-    // proceed." We surface the notification to the caller; if they don't
-    // supply a handler, we silently accept (no-op).
-    const onRequestTeardownEvt = (
-      params: McpUiRequestTeardownNotification["params"],
-    ) => onRequestTeardownRef.current?.(params);
-    b.addEventListener("requestteardown", onRequestTeardownEvt);
-
-    // `ui/notifications/initialized` — spec §"Lifecycle" fires once after
-    // the View's `ui/initialize` handshake completes. At this point
-    // `bridge.getAppCapabilities()` returns the View's declared capabilities
-    // (including `availableDisplayModes`), which chrome uses to gate
-    // mode-switch affordances.
-    //
-    // Use addEventListener (not the `oninitialized` setter) so we compose
-    // with @mcp-ui/client's AppFrame, which assigns its own `oninitialized`
-    // slot during its mount effect. Setter-assignment replaces (last wins);
-    // our callback would silently clobber AppFrame's init-ready bookkeeping
-    // and break downstream handlers, including `resources/subscribe`
-    // dispatch, because the bridge would never transition to ready.
-    const onInitializedEvt = () => {
-      initialized = true;
-      setViewInitialized(true);
-      onAppCapabilitiesRef.current?.(b.getAppCapabilities());
-      flushListChanged();
-    };
-    b.addEventListener("initialized", onInitializedEvt);
-
-    b.fallbackRequestHandler = (async (req: JSONRPCRequest, extra) => {
-      const cb = onFallbackRequestRef.current;
-      if (cb) return cb(req, extra);
-      throw new McpError(
-        ErrorCode.MethodNotFound,
-        `No handler for method: ${req.method}`,
-      );
-    }) as typeof b.fallbackRequestHandler;
-
-    setBridge(b);
+    controllerRef.current = next;
+    setController(next);
 
     return () => {
-      b.removeEventListener("requestteardown", onRequestTeardownEvt);
-      b.removeEventListener("initialized", onInitializedEvt);
-      unsubscribeFanOut?.();
-      unsubscribeToolListChanged?.();
-      unsubscribeResourceListChanged?.();
-      unsubscribePromptListChanged?.();
-      // Release any still-subscribed URIs upstream so the server doesn't
-      // keep a dangling subscription for this client. Fire-and-forget:
-      // failures are terminal (bridge torn down) and safe to swallow.
-      for (const uri of subscribedUris) {
-        client
-          .request(
-            { method: "resources/unsubscribe", params: { uri } },
-            ResultSchema,
-          )
-          .catch(() => {});
+      next.dispose();
+      if (controllerRef.current === next) {
+        controllerRef.current = null;
       }
-      subscribedUris.clear();
-      // Close the underlying transport; errors here are terminal-only and safe to swallow.
-      b.close().catch(() => {});
     };
   }, [
     client,
@@ -613,6 +277,33 @@ export const HostAppRenderer = forwardRef<
     onToolListChanged,
     onResourceListChanged,
     onPromptListChanged,
+  ]);
+
+  useEffect(() => {
+    controller?.updateHandlers({
+      onMessage,
+      onOpenLink,
+      onDownloadFile,
+      onUpdateModelContext,
+      onRequestDisplayMode,
+      onRequestTeardown,
+      onLoggingMessage,
+      onAppCapabilities,
+      onFallbackRequest,
+      onError,
+    });
+  }, [
+    controller,
+    onMessage,
+    onOpenLink,
+    onDownloadFile,
+    onUpdateModelContext,
+    onRequestDisplayMode,
+    onRequestTeardown,
+    onLoggingMessage,
+    onAppCapabilities,
+    onFallbackRequest,
+    onError,
   ]);
 
   // --- Resource fetch ------------------------------------------------------
@@ -658,72 +349,35 @@ export const HostAppRenderer = forwardRef<
     };
   }, [hostContext, containerDimensions]);
   useEffect(() => {
-    if (!bridge || !effectiveHostContext) return;
-    // `AppBridge.setHostContext` diffs against the previous value and
-    // only emits `ui/notifications/host-context-changed` when fields
-    // actually change, so handing it a new object identity each render
-    // is cheap — no redundant notifications hit the view.
-    bridge.setHostContext(effectiveHostContext);
-  }, [bridge, effectiveHostContext]);
+    controller?.setHostContext(effectiveHostContext);
+  }, [controller, effectiveHostContext]);
 
   // --- Streaming / lifecycle side-effects ---------------------------------
-  // Host→View notifications must wait until the View has sent
-  // `ui/notifications/initialized` — before that, `bridge.notification()`
-  // throws "Not connected" (transport attached in a later effect pass by
-  // AppFrame) or, worse, fires before the View has registered handlers.
-  // The `viewInitialized` gate defers sends; when the flag flips, React
-  // re-runs these effects and the latest value is dispatched automatically.
   useEffect(() => {
-    if (!bridge || !viewInitialized || !toolInputPartial) return;
-    bridge.sendToolInputPartial(toolInputPartial);
-  }, [bridge, viewInitialized, toolInputPartial]);
+    controller?.sendToolInputPartial(toolInputPartial);
+  }, [controller, toolInputPartial]);
 
   useEffect(() => {
-    if (!bridge || !viewInitialized || !toolCancelled) return;
-    bridge.sendToolCancelled({});
-  }, [bridge, viewInitialized, toolCancelled]);
+    controller?.sendToolCancelled(toolCancelled ? {} : undefined);
+  }, [controller, toolCancelled]);
 
   // --- Imperative handle ---------------------------------------------------
   useImperativeHandle(
     ref,
     () => ({
-      sendToolListChanged: () => {
-        if (!bridge || !viewInitialized) return;
-        bridge.sendToolListChanged().catch((err) => {
-          const e = err instanceof Error ? err : new Error(String(err));
-          onErrorRef.current?.(e);
-        });
-      },
-      sendResourceListChanged: () => {
-        if (!bridge || !viewInitialized) return;
-        bridge.sendResourceListChanged().catch((err) => {
-          const e = err instanceof Error ? err : new Error(String(err));
-          onErrorRef.current?.(e);
-        });
-      },
-      sendPromptListChanged: () => {
-        if (!bridge || !viewInitialized) return;
-        bridge.sendPromptListChanged().catch((err) => {
-          const e = err instanceof Error ? err : new Error(String(err));
-          onErrorRef.current?.(e);
-        });
-      },
-      // SEP-1865 §Cleanup: "Host SHOULD wait for a response before
-      // tearing down the resource (to prevent data loss)." We await
-      // the view's response and surface failures via `onError` rather
-      // than dropping them; callers that don't care can ignore the
-      // returned promise.
+      sendToolListChanged: () => controllerRef.current?.sendToolListChanged(),
+      sendResourceListChanged: () =>
+        controllerRef.current?.sendResourceListChanged(),
+      sendPromptListChanged: () =>
+        controllerRef.current?.sendPromptListChanged(),
       teardownResource: () => {
-        bridge?.teardownResource({}).catch((err) => {
-          const e = err instanceof Error ? err : new Error(String(err));
-          onErrorRef.current?.(e);
-        });
+        controllerRef.current?.teardownResource();
       },
     }),
-    [bridge, viewInitialized],
+    [],
   );
 
-  if (!bridge || html === null) return null;
+  if (!controller || html === null) return null;
 
   // The wrapping div exists purely so we own a DOM node to observe for
   // `containerDimensions` (see `frameContainerRef` above). AppFrame
@@ -738,7 +392,7 @@ export const HostAppRenderer = forwardRef<
       <AppFrame
         html={html}
         sandbox={sandbox}
-        appBridge={bridge}
+        appBridge={controller.bridge}
         toolInput={toolInput}
         toolResult={toolResult}
         onSizeChanged={onSizeChanged}

@@ -6,6 +6,7 @@
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
+    "test:mcp-app-host-controller": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test scripts/test-mcp-app-host-controller.ts",
     "lint": "biome check .",
     "format": "biome format .",
     "format:fix": "biome format --write .",
