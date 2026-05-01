@@ -10,13 +10,10 @@
     4. Relay every non-`ui/notifications/sandbox-*` message bidirectionally between
        the host (window.parent) and the inner iframe (View).
 
-  TODO(mcp-apps): Different-origin sandbox for production.
-  SEP-1865 §"Sandbox proxy" rule 1: "The Host and the Sandbox MUST have different origins."
-  https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
-  In dev we serve this page from Next.js public/ which is same-origin as the host. The
-  `allow-same-origin` sandbox flag therefore grants the proxy parent-DOM access, weakening
-  isolation. Production path: deploy this HTML to a separate subdomain (e.g. sandbox.example.com)
-  or static CDN, and set NEXT_PUBLIC_MCP_SANDBOX_URL so mcp-app-part.tsx points at it.
+  SEP-1865 §"Sandbox proxy" rule 1 requires the Host and Sandbox to use
+  different origins. Deploy this file to a dedicated sandbox origin and set
+  NEXT_PUBLIC_MCP_SANDBOX_URL to that absolute URL. The host code rejects
+  same-origin sandbox URLs.
 -->
 <!doctype html>
 <html lang="en">
